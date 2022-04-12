@@ -18,23 +18,25 @@ import jax
 from jax import numpy as jnp
 from jax import scipy as jsp
 from jax import random
+from jax import lax
 import matplotlib.pyplot as plt
-
-
-plt.rcParams.update({"font.size": 16})
 
 
 def generate_x_true(
         rng_key: jnp.DeviceArray, max_iter: int, x0_rvs: Callable,
         v_rvs: Callable, f: Callable):
+
+    def get_next_x_true(x_prev, k, v):
+        x_true = f(x_prev, v[k - 1], k=k - 1)
+        return x_true, x_true
+
     rng_keys = random.split(rng_key, num=2)
     x0 = x0_rvs(rng_keys[0], shape=())
-    x_true = jnp.zeros(shape=(max_iter + 1,))
-    x_true = x_true.at[0].set(x0)
-    v = v_rvs(rng_keys[1], shape=x_true.shape)
-    for k in range(1, max_iter + 1):
-        x_true = x_true.at[k].set(f(x_true[k - 1], v[k - 1], k=k - 1))
-    return jnp.array(x_true)
+    v = v_rvs(rng_keys[1], shape=(max_iter + 1,))
+
+    get_next_x_true_func = functools.partial(get_next_x_true, v=v)
+    _, x_true = lax.scan(get_next_x_true_func, init=x0, xs=jnp.arange(1, max_iter + 1))
+    return jnp.array([x0, *x_true])
 
 
 def generate_y(
@@ -93,34 +95,29 @@ def novel_density(
     num_grid_points = x_grid.shape[0]
     delta = x_grid[1] - x_grid[0]
 
-    p_filter = jnp.zeros(shape=(max_iter + 1, num_grid_points))
-    p_filter = p_filter.at[0, :].set(x0_pdf(x_grid))
-    p_filter = p_filter.at[0, :].set(p_filter[0, :] / jnp.sum(p_filter[0, :]))
-    p_pred = jnp.ones(shape=(max_iter + 1, num_grid_points)) * jnp.inf
     rng_keys = random.split(rng_key, num=3)
     v = v_rvs(rng_keys[0], shape=(max_iter + 1, num_samples))
     e = e_rvs(rng_keys[1], shape=(max_iter + 1, num_samples))
 
-    for k in range(1, max_iter + 1):
-        x = inversion_sampling(
-            rng_keys[2],
-            x_grid,
-            p_filter[k - 1, :],
-            num_samples=num_samples,
-        )
+    p_filter0 = x0_pdf(x_grid)
+    p_filter0 /= jnp.sum(p_filter0)
+    p_pred0 = [jnp.inf]*num_grid_points
 
+    def get_next_novel_density(
+            p_filter_prev, k, x_grid, v, e, y_measured, num_samples, kernel_variance, rng_key):
+        x = inversion_sampling(rng_key, x_grid, p_filter_prev, num_samples)
         x = f(x, v[k], k - 1)
 
         # p(xk | y(1:k-1))
-        p_pred = p_pred.at[k, :].set(kde(x_grid, x, kernel_variance))
-        p_pred = p_pred.at[k, :].set(p_pred[k, :] / jnp.sum(p_pred[k, :]))
+        p_pred_k = kde(x_grid, x, kernel_variance)
+        p_pred_k = p_pred_k / jnp.sum(p_pred_k)
 
         # measurement
         y = h(x, e[k])
 
         # p(xk | y(1:k))
         threshold = 3 * jnp.sqrt(kernel_variance)
-        distance = jnp.abs(y[k] - y)
+        distance = jnp.abs(y_measured[k] - y)
 
         def update(xi, yi, distance_i):
             return jnp.where(
@@ -131,8 +128,21 @@ def novel_density(
             )
 
         update_vals = jax.vmap(update)(x, y, distance)
-        p_filter = p_filter.at[k, :].set(p_filter[k, :] + jnp.sum(update_vals, axis=0))
-        p_filter = p_filter.at[k, :].set(p_filter[k, :] / jnp.sum(p_filter[k, :]))
+        p_filter_k = jnp.sum(update_vals, axis=0)
+        p_filter_k = p_filter_k / jnp.sum(p_filter_k)
+        return p_filter_k, [p_filter_k, p_pred_k]
+
+    get_next_novel_density_func = functools.partial(
+        get_next_novel_density,
+        x_grid=x_grid, v=v, e=e, y_measured=y, num_samples=num_samples,
+        kernel_variance=kernel_variance, rng_key=rng_keys[2]
+    )
+
+    _, (p_filter, p_pred) = lax.scan(
+        get_next_novel_density_func, init=p_filter0, xs=jnp.arange(1, max_iter + 1)
+    )
+    p_filter = jnp.array([p_filter0, *p_filter])
+    p_pred = jnp.array([p_pred0, *p_pred])
     return p_filter / delta, p_pred / delta
 
 
@@ -145,37 +155,56 @@ def point_mass_density(
     delta = x_grid[1] - x_grid[0]
     X = jnp.tile(x_grid, (num_grid_points, 1))
 
-    p_filter = jnp.zeros(shape=(max_iter + 1, num_grid_points))
-    p_filter = p_filter.at[0, :].set(x0_pdf(x_grid))
-    p_filter = p_filter.at[0, :].set(p_filter[0, :] / sum(p_filter[0, :]))  # normalize
-    p_pred = jnp.ones(shape=(max_iter + 1, num_grid_points)) * jnp.inf
+    p_filter0 = x0_pdf(x_grid)
+    p_filter0 /= jnp.sum(p_filter0)
+    p_pred0 = [jnp.inf]*num_grid_points
 
-    for k in range(1, max_iter + 1):
+    def get_next_filter_pred_densities(p_filter_prev, k, x_grid, X, y):
         # p(xk, xk-1 | y(1:k-1))
         px = x_pdf(k=k - 1, x_new=X.T, x=X, v_pdf=v_pdf, f=f)
-        p_joint = px * p_filter[k - 1, :]
+        p_joint = px * p_filter_prev
 
         # p(xk | y(1:k-1))
-        p_pred = p_pred.at[k, :].set(jnp.sum(p_joint, axis=1))
-        p_pred = p_pred.at[k, :].set(p_pred[k, :] / jnp.sum(p_pred[k, :]))
+        p_pred_k = jnp.sum(p_joint, axis=1)
+        p_pred_k /= jnp.sum(p_pred_k)
 
         # p(xk | y(1:k))
-        p_filter = p_filter.at[k, :].set(
-            p_pred[k, :] * y_likelihood(y[k], x_grid, e_pdf, h)
-        )
-        p_filter = p_filter.at[k, :].set(p_filter[k, :] / jnp.sum(p_filter[k, :]))
+        p_filter_k = p_pred_k * y_likelihood(y[k], x_grid, e_pdf, h)
+        p_filter_k /= jnp.sum(p_filter_k)
+        return p_filter_k, [p_filter_k, p_pred_k]
 
-    p_smooth = jnp.array(p_filter.copy())
-    for k in range(max_iter - 1, -1, -1):
+    get_next_filter_pred_densities_func = functools.partial(
+        get_next_filter_pred_densities, x_grid=x_grid, X=X, y=y
+    )
+
+    _, (p_filter, p_pred) = lax.scan(
+        get_next_filter_pred_densities_func,
+        init=p_filter0, xs=jnp.arange(1, max_iter + 1),
+    )
+    p_filter = jnp.array([p_filter0, *p_filter])
+    p_pred = jnp.array([p_pred0, *p_pred])
+
+    p_smooth_max_iter = jnp.array(p_filter[max_iter].copy())
+
+    def get_next_smooth_density(p_smooth_prev, k, X, p_filter):
         # p(xk, xk-1 | y(1:k-1))
         px = x_pdf(k=k, x_new=X.T, x=X, v_pdf=v_pdf, f=f)
-        px = px * p_smooth[k + 1, :].T / p_pred[k + 1, :].T
+        px = px * p_smooth_prev.T / p_pred[k + 1, :].T
 
-        p_smooth = p_smooth.at[k, :].set(jnp.sum(px, axis=1))  # marginalize
-        p_smooth = p_smooth.at[k, :].set(
-            p_smooth[k, :] * p_filter[k, :]
-        )  # multiply p(xk|yk)
-        p_smooth = p_smooth.at[k, :].set(p_smooth[k, :] / jnp.sum(p_smooth[k, :]))
+        p_smooth_k = jnp.sum(px, axis=1)  # marginalize
+        p_smooth_k = p_smooth_k * p_filter[k, :]  # multiply p(xk|yk)
+        p_smooth_k = p_smooth_k / jnp.sum(p_smooth_k)
+        return p_smooth_k, p_smooth_k
+
+    get_next_smooth_density_func = functools.partial(
+        get_next_smooth_density, X=X, p_filter=p_filter
+    )
+    _, p_smooth = lax.scan(
+        get_next_smooth_density_func,
+        init=p_smooth_max_iter, xs=jnp.arange(0, max_iter),
+        reverse=True
+    )
+    p_smooth = jnp.array([*p_smooth, p_smooth_max_iter])
 
     return p_filter / delta, p_pred / delta, p_smooth / delta
 
@@ -239,10 +268,10 @@ def plot_densities(
 
 
 def experiment_setup(
-    rng_key, grid_minval, grid_maxval,
-    num_grid_points, x0_rvs, v_rvs,
-    e_rvs, f, h,
-    max_iter, plot_xy=False):
+        rng_key, grid_minval, grid_maxval,
+        num_grid_points, x0_rvs, v_rvs,
+        e_rvs, f, h,
+        max_iter, plot_xy=False):
     # create 1d grid
     x_grid = jnp.linspace(grid_minval, grid_maxval, num_grid_points)
 
@@ -272,164 +301,148 @@ def experiment_setup(
 # functions for the particle filter example
 
 # state transition function
-def state_trans_func1(x, v, k):
+def state_trans_func_pf_example(x, v, k):
     return x / 2 + 25 * x / (1 + x**2) + 8 * jnp.cos(1.2 * (k + 1)) + v
 
 
 # measurement function
-def measure_func1(x, e):
+def measure_func_pf_example(x, e):
     return x**2 / 20 + e
 
 
 # to get x from measurement without noise
-def inv_measure_func1(y):
+def inv_measure_func_pf_example(y):
     x = jnp.sqrt(20 * y)
     return [x, -x]
 
 
 # functions to get sample
-def v_rvs1(rng_key, shape):
+def v_rvs_pf_example(rng_key, shape):
     return random.normal(rng_key, shape=shape) * jnp.sqrt(10)
 
 
-def e_rvs1(rng_key, shape):
+def e_rvs_pf_example(rng_key, shape):
     return random.normal(rng_key, shape=shape)
 
 
-def x0_rvs1(rng_key, shape):
+def x0_rvs_pf_example(rng_key, shape):
     return random.normal(rng_key, shape=shape)
-
-
-# functions to get density
-v_pdf1 = functools.partial(jsp.stats.norm.pdf, scale=jnp.sqrt(10))
-e_pdf1 = functools.partial(jsp.stats.norm.pdf, scale=1)
-x0_pdf1 = jsp.stats.norm.pdf
 
 
 def the_particle_filter_example(
-    rng_key=random.PRNGKey(4),
-    grid_minval=-30,
-    grid_maxval=30,
-    num_grid_points=500,
-    max_iter=20,
-    iter_=14,
-    plot_all_densities=False):
+        rng_key=random.PRNGKey(4),
+        grid_minval=-30,
+        grid_maxval=30,
+        num_grid_points=500,
+        max_iter=20,
+        iter_=14,
+        plot_all_densities=False,
+        x0_rvs=x0_rvs_pf_example,
+        v_rvs=v_rvs_pf_example,
+        e_rvs=e_rvs_pf_example,
+        f=state_trans_func_pf_example,
+        h=measure_func_pf_example,
+        inv_h=inv_measure_func_pf_example,
+        v_pdf=functools.partial(jsp.stats.norm.pdf, scale=jnp.sqrt(10)),
+        e_pdf=functools.partial(jsp.stats.norm.pdf, scale=1),
+        x0_pdf=jsp.stats.norm.pdf):
     # generate data points and densities
     x_grid, x_true, y = experiment_setup(
-        rng_key=rng_key, grid_minval=grid_minval, grid_maxval=grid_maxval,
-        num_grid_points=num_grid_points, x0_rvs=x0_rvs1, v_rvs=v_rvs1,
-        e_rvs=e_rvs1, f=state_trans_func1, h=measure_func1,
-        max_iter=max_iter, plot_xy=False,
+        rng_key, grid_minval, grid_maxval, num_grid_points,
+        x0_rvs, v_rvs, e_rvs, f, h, max_iter, plot_xy=False,
     )
 
-
     p_filter, p_pred, p_smooth = point_mass_density(
-        y, x_grid, x0_pdf1,
-        x_pdf=x_pdf, v_pdf=v_pdf1, e_pdf=e_pdf1,
-        f=state_trans_func1, h=measure_func1,
+        y, x_grid, x0_pdf, x_pdf, v_pdf, e_pdf, f, h,
     )
 
     if plot_all_densities:
         # looking for weird density plot by plotting all max_iter densities
-        plot_densities(
-            x_true, y, inv_measure_func1,
-            x_grid, p_pred, p_filter,
-            p_smooth, max_iter,
-        )
+        plot_densities(x_true, y, inv_h, x_grid, p_pred, p_filter, p_smooth, max_iter)
 
     # plot the kth density
     plot_density(
-        x_true, y, inv_measure_func1,
+        x_true, y, inv_h,
         x_grid, p_pred, p_filter,
         p_smooth, k=iter_, legend=True,
         ax=None, title=f"Particle filter example densities at $x_{{{iter_}}}$",
     )
 
-    plt.show()
-
 
 # functions for student t random walk example
 
 # state transition function
-def state_trans_func2(x, v, k=None):
+def state_trans_func_student_t_example(x, v, k=None):
     return x + v
 
 
 # measurement function
-def measure_func2(x, e):
+def measure_func_student_t_example(x, e):
     return x + e
 
 
 # to get x from measurement without noise
-def inv_measure_func2(y):
+def inv_measure_func_student_t_example(y):
     return y
 
 
 # functions to get sample
-def v_rvs2(rng_key, shape):
+def v_rvs_student_t_example(rng_key, shape):
     return random.t(rng_key, df=3, shape=shape)
 
 
-def e_rvs2(rng_key, shape):
+def e_rvs_student_t_example(rng_key, shape):
     return random.t(rng_key, df=3, shape=shape)
 
 
-def x0_rvs2(rng_key, shape):
+def x0_rvs_student_t_example(rng_key, shape):
     return random.t(rng_key, df=3, shape=shape)
-
-
-# functions to get density
-pdf2 = functools.partial(jsp.stats.t.pdf, df=3)
-v_pdf2 = pdf2
-e_pdf2 = pdf2
-x0_pdf2 = pdf2
 
 
 def student_t_random_walk_example(
-    rng_key=random.PRNGKey(0),
-    grid_minval=-60,
-    grid_maxval=30,
-    num_grid_points=500,
-    max_iter=25,
-    iter_=22,
-    plot_all_densities=False):
+        rng_key=random.PRNGKey(0),
+        grid_minval=-60,
+        grid_maxval=30,
+        num_grid_points=500,
+        max_iter=25,
+        iter_=22,
+        plot_all_densities=False,
+        x0_rvs=x0_rvs_student_t_example,
+        v_rvs=v_rvs_student_t_example,
+        e_rvs=e_rvs_student_t_example,
+        f=state_trans_func_student_t_example,
+        h=measure_func_student_t_example,
+        inv_h=inv_measure_func_student_t_example,
+        v_pdf=functools.partial(jsp.stats.t.pdf, df=3),
+        e_pdf=functools.partial(jsp.stats.t.pdf, df=3),
+        x0_pdf=functools.partial(jsp.stats.t.pdf, df=3)):
     # generate data points and densities
     x_grid, x_true, y = experiment_setup(
-        rng_key=rng_key, grid_minval=grid_minval, grid_maxval=grid_maxval,
-        num_grid_points=num_grid_points, x0_rvs=x0_rvs2, v_rvs=v_rvs2,
-        e_rvs=e_rvs2, f=state_trans_func2, h=measure_func2,
-        max_iter=max_iter, plot_xy=False,
+        rng_key, grid_minval, grid_maxval, num_grid_points,
+        x0_rvs, v_rvs, e_rvs, f, h, max_iter, plot_xy=False,
     )
 
     p_filter, p_pred, p_smooth = point_mass_density(
-        y, x_grid, x0_pdf2,
-        x_pdf=x_pdf, v_pdf=v_pdf2, e_pdf=e_pdf2,
-        f=state_trans_func2, h=measure_func2,
+        y, x_grid, x0_pdf, x_pdf, v_pdf, e_pdf, f, h,
     )
 
     if plot_all_densities:
         # looking for weird density plot by plotting all max_iter densities
-        plot_densities(
-            x_true, y, inv_measure_func2,
-            x_grid, p_pred, p_filter,
-            p_smooth, max_iter,
-        )
+        plot_densities(x_true, y, inv_h, x_grid, p_pred, p_filter, p_smooth, max_iter)
 
     # plot the kth density
     plot_density(
-        x_true, y, inv_measure_func2,
+        x_true, y, inv_h,
         x_grid, p_pred, p_filter,
         p_smooth, k=iter_, legend=True,
         ax=None, title=f"Student's t random walk example densities at $x_{{{iter_}}}$",
     )
 
-    plt.show()
-
 
 # functions for saturated measurements example
 
 # state transition function
-def state_trans_func3(x, v, k=None):
+def state_trans_func_saturated_example(x, v, k=None):
     return 0.7 * x + v
 
 
@@ -438,78 +451,75 @@ def saturate(x, minval, maxval):
     return jnp.maximum(jnp.minimum(x, maxval), minval)
 
 
-def measure_func3(x, e, minval=-1.5, maxval=1.5):
+def measure_func_saturated_example(x, e, minval=-1.5, maxval=1.5):
     return saturate(x + e, minval=minval, maxval=maxval)
 
 
 # to get x from measurement without noise
-def inv_measure_func3(y):
+def inv_measure_func_saturated_example(y):
     return y
 
 
 # functions to get sample
-def v_rvs3(rng_key, shape):
+def v_rvs_saturated_example(rng_key, shape):
     return random.normal(rng_key, shape=shape)
 
 
-def e_rvs3(rng_key, shape):
+def e_rvs_saturated_example(rng_key, shape):
     return random.normal(rng_key, shape=shape) * jnp.sqrt(0.5)
 
 
-def x0_rvs3(rng_key, shape):
+def x0_rvs_saturated_example(rng_key, shape):
     return random.normal(rng_key, shape=shape) * jnp.sqrt(0.1)
 
 
-# functions to get density
-x0_pdf3 = functools.partial(jsp.stats.norm.pdf, scale=jnp.sqrt(0.1))
-
-
 def saturated_measurements_example(
-    rng_key=random.PRNGKey(0),
-    num_samples=10000,
-    grid_minval=-6,
-    grid_maxval=6,
-    num_grid_points=500,
-    max_iter=24,
-    iter_=18,
-    plot_all_densities=False):
+        rng_key=random.PRNGKey(0),
+        num_samples=10000,
+        grid_minval=-6,
+        grid_maxval=6,
+        num_grid_points=500,
+        max_iter=24,
+        iter_=18,
+        plot_all_densities=False,
+        x0_rvs=x0_rvs_saturated_example,
+        v_rvs=v_rvs_saturated_example,
+        e_rvs=e_rvs_saturated_example,
+        f=state_trans_func_saturated_example,
+        h=measure_func_saturated_example,
+        inv_h=inv_measure_func_saturated_example,
+        x0_pdf=functools.partial(jsp.stats.norm.pdf, scale=jnp.sqrt(0.1))):
     # generate data points and densities
     rng_key, subkey = random.split(rng_key, num=2)
     x_grid, x_true, y = experiment_setup(
-        rng_key=rng_key, grid_minval=grid_minval, grid_maxval=grid_maxval,
-        num_grid_points=num_grid_points, x0_rvs=x0_rvs3, v_rvs=v_rvs3,
-        e_rvs=e_rvs3, f=state_trans_func3, h=measure_func3,
-        max_iter=max_iter, plot_xy=True,
+        rng_key, grid_minval, grid_maxval, num_grid_points,
+        x0_rvs, v_rvs, e_rvs, f, h, max_iter, plot_xy=False,
     )
 
     p_filter, p_pred = novel_density(
         subkey, y, x_grid,
-        x0_pdf3, v_rvs3, e_rvs3,
-        state_trans_func3, measure_func3, num_samples,
+        x0_pdf, v_rvs, e_rvs,
+        f, h, num_samples,
         max_iter, kernel_variance=0.15,
     )
     p_smooth = None
 
     if plot_all_densities:
         # looking for weird density plot by plotting all max_iter densities
-        plot_densities(
-            x_true, y, inv_measure_func3,
-            x_grid, p_pred, p_filter,
-            p_smooth, max_iter,
-        )
+        plot_densities(x_true, y, inv_h, x_grid, p_pred, p_filter, p_smooth, max_iter)
 
     # plot the kth density
     plot_density(
-        x_true, y, inv_measure_func3,
+        x_true, y, inv_h,
         x_grid, p_pred, p_filter,
         p_smooth, k=iter_, legend=True,
         ax=None, title=f"Saturated measurements example densities at $x_{{{iter_}}}$",
     )
 
-    plt.show()
-
 
 if __name__ == '__main__':
+    plt.rcParams.update({"font.size": 16})
     the_particle_filter_example()
     student_t_random_walk_example()
     saturated_measurements_example()
+    plt.show()
